@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+# weekly_automotive_news_report.py
+"""
+Fetches automotive-related news (Google News RSS), categorizes items by type,
+creates a short one-line insight for each article, writes a CSV/HTML report,
+and emails the latest HTML report via SMTP.
+"""
+
+import argparse
+import os
+from datetime import datetime
+import feedparser
+import pandas as pd
+from dateutil import parser as dateparser
+import glob
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+
+# ----------------------- Configuration -----------------------
+QUERY = 'automotive OR auto OR cars OR EV OR electric vehicle OR autonomous OR ADAS OR mobility'
+RSS_URL = ('https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en').format(query=QUERY.replace(' ', '+'))
+REPORT_DIR = 'reports'
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+CATEGORIES = [
+    ('Recall', ['recall', 'recalled']),
+    ('M&A', ['acquir', 'acquisition', 'merge', 'merger', 'buyout', 'takeover', 'acquired']),
+    ('Product Launch', ['launch', 'unveil', 'introduc', 'debut', 'reveal']),
+    ('Regulation', ['regulat', 'law', 'ban', 'rule', 'epa', 'policy', 'standard']),
+    ('Funding', ['funding', 'raise', 'investment', 'investor', 'series a', 'ipo', 'raised']),
+    ('Safety', ['crash', 'safety', 'incident', 'fatal', 'injury']),
+    ('Partnership', ['partnership', 'collaborat', 'partner', 'alliance']),
+    ('Technology', ['sensor', 'lidar', 'radar', 'ai', 'software', 'semiconductor', 'chip', 'perception']),
+    ('EV', ['electric', 'ev', 'battery', 'charging', 'range', 'kwh']),
+    ('Autonomous', ['autonom', 'self-driving', 'driverless', 'ads', 'adas', 'autopilot']),
+]
+
+def categorize(title, summary):
+    text = (title + ' ' + (summary or '')).lower()
+    for cat, keywords in CATEGORIES:
+        for kw in keywords:
+            if kw in text:
+                return cat
+    return 'Other'
+
+def short_insight(title, summary, category):
+    base = title.strip()
+    if category == 'Recall':
+        return f"Recall alert — likely impacts brand reputation or service actions: {base}"
+    if category == 'M&A':
+        return f"M&A — consolidation signal; watch integration and market-share shifts: {base}"
+    if category == 'Product Launch':
+        return f"New product — competitive offering or feature leap: {base}"
+    if category == 'Regulation':
+        return f"Regulatory update — may affect compliance or market access: {base}"
+    if category == 'Funding':
+        return f"Funding news — capital inflow for growth/scale: {base}"
+    if category == 'Safety':
+        return f"Safety incident — potential recalls, liability, or regulatory scrutiny: {base}"
+    if category == 'Partnership':
+        return f"Partnership — strategic cooperation to accelerate capability/scale: {base}"
+    if category == 'Technology':
+        return f"Tech update — evolution in core stack or components: {base}"
+    if category == 'EV':
+        return f"EV-related — impacts electrification trends or charging infra: {base}"
+    if category == 'Autonomous':
+        return f"Autonomy update — progress or setback in self-driving tech: {base}"
+    return base
+
+def fetch_rss(url):
+    feed = feedparser.parse(url)
+    items = []
+    for e in feed.entries:
+        published = None
+        if hasattr(e, 'published'):
+            try:
+                published = dateparser.parse(e.published)
+            except Exception:
+                published = None
+        items.append({
+            'title': e.title,
+            'link': e.link,
+            'summary': getattr(e, 'summary', ''),
+            'published': published,
+            'source': getattr(e, 'source', {}).get('title', '') if getattr(e, 'source', None) else '',
+        })
+    return items
+
+def make_report(items, output_prefix='report'):
+    rows = []
+    for it in items:
+        cat = categorize(it['title'], it['summary'])
+        insight = short_insight(it['title'], it['summary'], cat)
+        rows.append({
+            'published': it['published'].isoformat() if it['published'] else '',
+            'source': it['source'],
+            'title': it['title'],
+            'link': it['link'],
+            'category': cat,
+            'insight': insight,
+        })
+    df = pd.DataFrame(rows)
+    try:
+        df['published_dt'] = pd.to_datetime(df['published'])
+        df = df.sort_values('published_dt', ascending=False).drop(columns=['published_dt'])
+    except Exception:
+        pass
+    timestamp = datetime.utcnow().strftime('%Y%m%d')
+    csv_path = os.path.join(REPORT_DIR, f'{output_prefix}-{timestamp}.csv')
+    html_path = os.path.join(REPORT_DIR, f'{output_prefix}-{timestamp}.html')
+    df.to_csv(csv_path, index=False)
+    html = df.to_html(index=False, escape=False, render_links=True)
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(f'<h2>Automotive weekly news — {timestamp} (generated UTC)</h2>\\n')
+        f.write(html)
+    return csv_path, html_path
+
+def send_email(smtp_host, smtp_port, smtp_user, smtp_pass, to_email, subject, html_path):
+    msg = MIMEMultipart()
+    msg['From'] = smtp_user
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    body = "Weekly automotive news — short news and key takeaways. See attached report."
+    msg.attach(MIMEText(body, 'plain'))
+    with open(html_path, 'rb') as f:
+        part = MIMEApplication(f.read(), Name=os.path.basename(html_path))
+        part['Content-Disposition'] = f'attachment; filename=\"{os.path.basename(html_path)}\"'
+        msg.attach(part)
+    s = smtplib.SMTP(smtp_host, int(smtp_port))
+    s.starttls()
+    s.login(smtp_user, smtp_pass)
+    s.sendmail(smtp_user, to_email, msg.as_string())
+    s.quit()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output', default='weekly-automotive-report', help='output filename prefix')
+    args = parser.parse_args()
+
+    print('Fetching RSS:', RSS_URL)
+    items = fetch_rss(RSS_URL)
+    print(f'Fetched {len(items)} items')
+    csv_path, html_path = make_report(items, output_prefix=args.output)
+    print('Saved:', csv_path, html_path)
+
+    smtp_host = os.getenv('SMTP_HOST')
+    smtp_port = os.getenv('SMTP_PORT')
+    smtp_user = os.getenv('SMTP_USER')
+    smtp_pass = os.getenv('SMTP_PASS')
+    to_email = os.getenv('TO_EMAIL', 'amit.ak.069@gmail.com')
+    subject = os.getenv('EMAIL_SUBJECT', 'weekly automotive lineup')
+
+    if smtp_host and smtp_port and smtp_user and smtp_pass:
+        try:
+            latest_htmls = sorted(glob.glob(os.path.join(REPORT_DIR, f"{args.output}-*.html")))
+            if not latest_htmls:
+                latest_htmls = sorted(glob.glob(os.path.join(REPORT_DIR, 'report-*.html')))
+            if latest_htmls:
+                latest_html = latest_htmls[-1]
+                print('Sending email with attachment:', latest_html)
+                send_email(smtp_host, smtp_port, smtp_user, smtp_pass, to_email, subject, latest_html)
+                print('Email sent to', to_email)
+            else:
+                print('No HTML report found to attach. Skipping email send.')
+        except Exception as e:
+            print('Failed to send email:', str(e))
+    else:
+        print('SMTP credentials not provided in env vars. Skipping email send.')
